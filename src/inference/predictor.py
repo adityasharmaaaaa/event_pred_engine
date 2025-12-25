@@ -3,82 +3,60 @@ import pandas as pd
 import numpy as np
 from src.models.event_transformer import EventPredictor
 from src.utils.geo_utils import GeoGrid
+import os
 
 class RiskEngine:
-    def __init__(self, model_path="outputs/model_v1.pth"):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.geo = GeoGrid(resolution=5)
+    def __init__(self, model_path="outputs/model_v1.pth", load_weights=True):
+        self.device = torch.device("cpu")
         
-        # 1. Load Architecture
-        self.model = EventPredictor().to(self.device)
+        # Initialize the NEW V2 Model Architecture
+        # matching the parameters in your train.py
+        self.model = EventPredictor(d_model=128, n_layers=3, dropout=0.2).to(self.device)
         
-        # 2. Load Weights
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        self.model.eval() # Set to evaluation mode (turns off Dropout)
-        print("✅ Prediction Engine Loaded.")
+        self.geo = GeoGrid()
+        
+        # Only load weights if requested and file exists
+        if load_weights and os.path.exists(model_path):
+            print(f"✅ Loading model from {model_path}...")
+            try:
+                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                self.model.eval()
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load weights (Architecture mismatch?): {e}")
+                print("   Starting with initialized weights (Fresh Model).")
+        else:
+            print("🆕 Initializing fresh model (No weights loaded).")
 
     def preprocess_window(self, df_window):
-        """Converts a raw DataFrame of last 7 days into a Tensor."""
-        # Ensure we have 7 days
-        if len(df_window) < 7:
-            print("⚠️ Not enough history for prediction (Need 7 days).")
-            return None, None
-
-        # Sort by date
+        """Converts a 7-day DataFrame window into tensors."""
+        # Ensure sorted by date
         df_window = df_window.sort_values('Day')
         
         # Extract features
-        embeddings = np.stack(df_window['embedding'].values) # (7, 384)
+        text_embs = np.stack(df_window['embedding'].values)
+        econ_vals = df_window['volatility_7d'].values.reshape(-1, 1)
         
-        # Normalize volatility (using same stats as training - simplified here)
-        econ_raw = df_window['volatility_7d'].values.reshape(-1, 1)
-        econ = (econ_raw - econ_raw.mean()) / (econ_raw.std() + 1e-6)
-
-        # To Tensor & Add Batch Dimension (1, 7, Dim)
-        txt_tensor = torch.FloatTensor(embeddings).unsqueeze(0).to(self.device)
-        eco_tensor = torch.FloatTensor(econ).unsqueeze(0).to(self.device)
+        # Convert to Tensor & Add Batch Dimension (1, 7, Dim)
+        txt_tensor = torch.FloatTensor(text_embs).unsqueeze(0).to(self.device)
+        eco_tensor = torch.FloatTensor(econ_vals).unsqueeze(0).to(self.device)
         
         return txt_tensor, eco_tensor
 
-    def predict(self, df_history, location_hex):
-        """
-        Input: DataFrame containing history for all locations.
-        Output: Probability of unrest tomorrow.
-        """
-        # Filter for specific location
-        df_loc = df_history[df_history['h3_hex'] == location_hex].copy()
+    def predict(self, df, hex_id):
+        """Predicts risk for a single hex ID given the full dataframe."""
+        # Filter for specific hex
+        df_loc = df[df['h3_hex'] == hex_id].sort_values('Day')
         
-        # Get last 7 days
-        df_loc = df_loc.sort_values('Day').tail(7)
-        
+        # We need the LAST 7 days to predict "Tomorrow"
         if len(df_loc) < 7:
             return 0.0 # Not enough data
             
-        # Prepare inputs
-        txt, eco = self.preprocess_window(df_loc)
+        recent_window = df_loc.tail(7)
         
-        # Forward Pass
+        txt, eco = self.preprocess_window(recent_window)
+        
+        self.model.eval()
         with torch.no_grad():
-            probability = self.model(txt, eco).item()
+            risk_score = self.model(txt, eco).item()
             
-        return probability
-
-if __name__ == "__main__":
-    # Test Run
-    engine = RiskEngine()
-    
-    # Load data (Simulating "Live Database")
-    df = pd.read_parquet("data/processed/training_sets/train_multimodal.parquet")
-    
-    # Pick a random location from the dataset to test
-    sample_hex = df['h3_hex'].iloc[0]
-    
-    print(f"\n🔮 Analyzing Risk for Location: {sample_hex} ...")
-    risk = engine.predict(df, sample_hex)
-    
-    print(f"⚡ CIVIL UNREST PROBABILITY (24H): {risk:.2%}")
-    
-    if risk > 0.5:
-        print("🚨 ALERT: High risk of disruption detected!")
-    else:
-        print("✅ Status: Stable.")
+        return risk_score

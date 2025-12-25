@@ -1,59 +1,93 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from src.training.dataset import EventDataset
+from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
+import numpy as np
 from src.models.event_transformer import EventPredictor
+from src.inference.predictor import RiskEngine
+import os
 
 def train_model():
-    # 1. Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Training on {device}")
+    print("🚀 Training V2: Deep Transformer...")
     
-    # 2. Data
-    full_dataset = EventDataset("data/processed/training_sets/train_multimodal.parquet")
+    # 1. Load Data
+    data_path = "data/processed/training_sets/train_multimodal.parquet"
+    if not os.path.exists(data_path):
+        print("❌ Data not found.")
+        return
+        
+    df = pd.read_parquet(data_path)
+    engine = RiskEngine(load_weights=False) # Helper to format data
     
-    # 80/20 Train/Val split
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_data, val_data = random_split(full_dataset, [train_size, val_size])
+    # 2. Build Sequences
+    print("Building temporal sequences...")
+    X_text, X_econ, y = [], [], []
     
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=32)
+    # Group by Hex to respect temporal order
+    for _, group in df.groupby('h3_hex'):
+        group = group.sort_values('Day')
+        if len(group) < 7: continue
+            
+        # Sliding window
+        t_emb = np.stack(group['embedding'].values)
+        e_val = group['volatility_7d'].values.reshape(-1, 1)
+        targets = group['target_label'].values
+        
+        for i in range(len(group) - 7):
+            X_text.append(t_emb[i:i+7])
+            X_econ.append(e_val[i:i+7])
+            y.append(targets[i+7]) # Predict next day
+            
+    # Convert to Tensors
+    X_text = torch.FloatTensor(np.array(X_text))
+    X_econ = torch.FloatTensor(np.array(X_econ))
+    y = torch.FloatTensor(np.array(y)).unsqueeze(1)
     
-    # 3. Model
-    model = EventPredictor().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.BCELoss() # Binary Cross Entropy for 0/1 Event
+    dataset = TensorDataset(X_text, X_econ, y)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
     
-    # 4. Loop
-    epochs = 5
+    # 3. Initialize Model (Bigger & Deeper)
+    device = torch.device("cpu") # M1 Mac supports mps but cpu is stable for small batch
+    model = EventPredictor(d_model=128, n_layers=3, dropout=0.2).to(device)
+    
+    # Optimizer & Scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    criterion = nn.BCELoss()
+    
+    # 4. Training Loop
+    epochs = 10
+    best_loss = float('inf')
+    
     for epoch in range(epochs):
         model.train()
         total_loss = 0
         
-        for batch in train_loader:
-            txt = batch['text_seq'].to(device)
-            eco = batch['econ_seq'].to(device)
-            lbl = batch['label'].to(device)
+        for batch_txt, batch_eco, batch_y in loader:
+            batch_txt, batch_eco, batch_y = batch_txt.to(device), batch_eco.to(device), batch_y.to(device)
             
             optimizer.zero_grad()
-            
-            # Forward
-            preds = model(txt, eco)
-            loss = criterion(preds, lbl)
-            
-            # Backward
+            predictions = model(batch_txt, batch_eco)
+            loss = criterion(predictions, batch_y)
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
             
-        print(f"Epoch {epoch+1} | Loss: {total_loss / len(train_loader):.4f}")
+        avg_loss = total_loss / len(loader)
         
-    # 5. Save
-    torch.save(model.state_dict(), "outputs/model_v1.pth")
-    print("✅ Model saved to outputs/model_v1.pth")
+        # Step the scheduler
+        scheduler.step(avg_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), "outputs/model_v1.pth") # Overwrite V1
+            
+    print(f"✅ Model trained. Best Loss: {best_loss:.4f}")
 
 if __name__ == "__main__":
     train_model()
